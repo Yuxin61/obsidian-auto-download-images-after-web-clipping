@@ -5,6 +5,10 @@ I want the images to be saved locally.
 There are several solutions. For example, you can assign a shortcut key to `editor:download-attachments` to manually download the images to your local device.  
 However, I hope for something more automated. So this plugin was created.
 
+# Installation
+
+[https://community.obsidian.md/plugins/auto-download-images-after-web-clipping](https://community.obsidian.md/plugins/auto-download-images-after-web-clipping)
+
 # Plugin Features
 
 This plugin is very simple. When you clip a document using the Web Clipper plugin, it will automatically download the images in the document to your local device in the background.
@@ -21,16 +25,3 @@ You can adjust the save path of images in the settings:
 Follow Obsidian's attachment save location (default)  
 Create a folder with the same name as the file  
 A specified subfolder in the directory where the file is located
-
-# How to Install
-
-## Method 1:
-
-You can download the compressed file from Releases, extract it to the `.obsidian/plugins` directory in Obsidian, then refresh the plugin list in Obsidian and enable it.
-
-## Method 2
-
-Use the BRAT plugin, click the BRAT button in the sidebar, click Add Plugin, and enter: [https://github.com/chenxiccc/obsidian-auto-download-images-after-web-clipping](https://github.com/chenxiccc/obsidian-auto-download-images-after-web-clipping)
-
-# License
-This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
