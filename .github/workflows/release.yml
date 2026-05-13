@@ -12,6 +12,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   release:
@@ -32,18 +34,21 @@ jobs:
       - name: Install dependencies and build
         run: npm ci && npm run build
 
-      # 从 manifest.json 读取版本号和插件 ID | Read version and plugin ID from manifest.json
+      # 从 manifest.json 读取版本号 | Read version from manifest.json
       - name: Read manifest metadata
         id: meta
         run: |
           VERSION=$(jq -r '.version' manifest.json)
-          PLUGIN_ID=$(jq -r '.id' manifest.json)
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "zip=${PLUGIN_ID}-${VERSION}.zip" >> $GITHUB_OUTPUT
 
-      # 打包 main.js 和 manifest.json 为 zip | Bundle main.js and manifest.json into a zip
-      - name: Build zip
-        run: zip "${{ steps.meta.outputs.zip }}" main.js manifest.json
+      # 为构建产物生成来源证明，确保用户可加密验证文件来自此仓库
+      # Generate provenance attestation for build artifacts so users can cryptographically verify origin
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            main.js
+            manifest.json
 
       # 若同名 Release/Tag 已存在则先删除，确保内容始终是最新的
       # Delete existing release and tag if present, so the latest content always wins
@@ -62,4 +67,3 @@ jobs:
           files: |
             main.js
             manifest.json
-            ${{ steps.meta.outputs.zip }}
