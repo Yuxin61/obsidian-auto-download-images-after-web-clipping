@@ -41,12 +41,22 @@ const MIME_EXT_MAP: Record<string, string> = {
 
 // ─── 工具函数 / Utility functions ──────────────────────────────────────────
 
-// 根据 linkFormat 生成最终的图片引用字符串
-// Generate image reference string according to linkFormat
-function formatImageLink(destPath: string, alt: string, linkFormat: string): string {
-  return linkFormat === 'wikilink'
-    ? `![[${destPath}]]`
-    : `![${alt}](<${destPath}>)`;
+// 根据 useMarkdownLinks 生成最终的图片引用字符串（遵循 Obsidian「文件与链接」设置）
+// Generate image reference string based on useMarkdownLinks (follows Obsidian "Files & Links" setting)
+function formatImageLink(destPath: string, alt: string, useMarkdownLinks: boolean): string {
+  return useMarkdownLinks
+    ? `![${alt}](<${destPath}>)`
+    : `![[${destPath}]]`;
+}
+
+// 为带链接的图片生成最终引用格式：[![alt](img)](link) 的替换
+// 在 wikilink 模式下丢弃外层链接（wikilink 不支持嵌套在 markdown 链接中），markdown 模式下保留
+// Generate final reference for linked images: replacement for [![alt](img)](link)
+// In wikilink mode, discard outer link (wikilink can't be nested in markdown links); preserve in markdown mode
+function formatLinkedImageLink(destPath: string, alt: string, linkUrl: string, useMarkdownLinks: boolean): string {
+  return useMarkdownLinks
+    ? `[![${alt}](<${destPath}>)](${linkUrl})`
+    : `![[${destPath}]]`;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -119,6 +129,9 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
 
   // 缓存的监听文件夹列表 | Cached watched folders list
   _watchedFolders: string[];
+
+  // 缓存的 Obsidian「使用 Wiki 链接」设置 | Cached Obsidian "Use Wiki Links" setting
+  _useMarkdownLinks: boolean;
 
   get t(): TranslationMap {
     return TRANSLATIONS[this._resolvedLang] ?? TRANSLATIONS['en']!;
@@ -290,12 +303,24 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
       // ── 5. 原子写回：用 vault.process 替换所有成功下载的链接
       //       Atomic write-back: replace all successfully downloaded links via vault.process
       if (urlToLocal.size > 0) {
-        const { linkFormat } = this.settings;
+        const useMarkdownLinks = this._useMarkdownLinks;
         try {
           await this.app.vault.process(file, (currentContent) => {
             let updated = currentContent;
             for (const [url, destPath] of urlToLocal) {
               const urlEscaped = url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+              // 先替换带链接的 Markdown 图片：[![alt](url)](link-url)
+              // 如果没有匹配到（独立图片），再由下面的正则处理
+              // First replace linked Markdown images: [![alt](url)](link-url)
+              // If no match (standalone image), the regex below handles it
+              const linkedMdRe = new RegExp(
+                `\\[!\\[([^\\]]*)\\]\\(${urlEscaped}(?:\\s+(?:"[^"]*"|'[^']*'))?\\)\\]\\(([^)]+)\\)`,
+                'g'
+              );
+              updated = updated.replace(linkedMdRe, (_, alt: string, linkUrl: string) =>
+                formatLinkedImageLink(destPath, alt, linkUrl, useMarkdownLinks)
+              );
 
               // 替换 Markdown 格式图片链接（含可选 title）
               // Replace Markdown image links (with optional title)
@@ -304,7 +329,7 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
                 'g'
               );
               updated = updated.replace(mdRe, (_, alt: string) =>
-                formatImageLink(destPath, alt, linkFormat)
+                formatImageLink(destPath, alt, useMarkdownLinks)
               );
 
               // 替换 HTML <img> 标签，从标签属性中提取 alt
@@ -316,7 +341,7 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
               updated = updated.replace(htmlRe, (fullTag: string) => {
                 const altMatch = fullTag.match(/\balt=(?:"([^"]*)"|'([^']*)')/i);
                 const alt = altMatch ? (altMatch[1] ?? altMatch[2] ?? '') : '';
-                return formatImageLink(destPath, alt, linkFormat);
+                return formatImageLink(destPath, alt, useMarkdownLinks);
               });
             }
             return updated;
@@ -464,11 +489,28 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
     return m ? `.${(m[1] ?? 'jpg').toLowerCase()}` : '.jpg';
   }
 
+  // 读取 Obsidian「使用 Wiki 链接」设置来决定图片引用格式
+  // 该设置不在公开 API 中，通过读取 .obsidian/app.json 获取
+  // Read Obsidian "Use Wiki Links" setting to determine image link format
+  // This setting is not in the public API, read from .obsidian/app.json
+  private async resolveUseMarkdownLinks(): Promise<boolean> {
+    try {
+      const configPath = `${this.app.vault.configDir}/app.json`;
+      const raw = await this.app.vault.adapter.read(configPath);
+      const config = JSON.parse(raw) as Record<string, unknown>;
+      return config.useMarkdownLinks === true;
+    } catch {
+      // 读取失败时默认使用 wikilink | Default to wikilink on read failure
+      return false;
+    }
+  }
+
   async loadSettings(): Promise<void> {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<AutoDownloadSettings>);
     // 缓存解析结果，避免每次事件都重新计算 | Cache derived values to avoid recomputation on every event
     this._resolvedLang   = this.settings.language === 'auto' ? detectObsidianLang() : this.settings.language;
     this._watchedFolders = parseFolders(this.settings.watchFolders);
+    this._useMarkdownLinks = await this.resolveUseMarkdownLinks();
   }
 
   async saveSettings(): Promise<void> {

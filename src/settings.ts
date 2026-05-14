@@ -26,11 +26,6 @@ export interface TranslationMap {
   customFolderSettingDesc: string;
   customFolderPlaceholder: string;
 
-  linkFormatSettingName:   string;
-  linkFormatSettingDesc:   string;
-  linkFormatWikilink:      string;
-  linkFormatMarkdown:      string;
-
   noticeSuccess:           (count: number, name: string) => string;
   noticePartial:           (ok: number, fail: number, name: string) => string;
   noticeWriteError:        (name: string) => string;
@@ -76,11 +71,6 @@ export const TRANSLATIONS: Record<string, TranslationMap> = {
     customFolderSettingName:    'Subfolder name',
     customFolderSettingDesc:    'Folder name relative to the note\'s directory. Default: attachments',
     customFolderPlaceholder:    'attachments',
-
-    linkFormatSettingName:      'Image link format',
-    linkFormatSettingDesc:      'Format used when inserting downloaded images into notes.',
-    linkFormatWikilink:         'Wikilink  ![[...]]',
-    linkFormatMarkdown:         'Markdown  ![alt](...)',
 
     noticeSuccess:              (count, name) => `✅ Downloaded ${count} image(s) — ${name}`,
     noticePartial:              (ok, fail, name) => `⚠️ ${name}: ${ok} succeeded, ${fail} failed (original links kept)`,
@@ -129,11 +119,6 @@ export const TRANSLATIONS: Record<string, TranslationMap> = {
     customFolderSettingDesc:    '相对于笔记所在目录的子文件夹名称，默认为 attachments',
     customFolderPlaceholder:    'attachments',
 
-    linkFormatSettingName:      '图片引用格式',
-    linkFormatSettingDesc:      '下载的图片插入笔记时使用的链接格式。',
-    linkFormatWikilink:         'Wiki 链接  ![[...]]',
-    linkFormatMarkdown:         'Markdown  ![alt](...)',
-
     noticeSuccess:              (count, name) => `✅ 图片下载完成：${count} 张（${name}）`,
     noticePartial:              (ok, fail, name) => `⚠️ ${name}：${ok} 张成功，${fail} 张失败（已保留原始链接）`,
     noticeWriteError:           (name) => `[AutoDL] 写回 ${name} 失败，请查看控制台日志`,
@@ -164,7 +149,6 @@ export function detectObsidianLang(): string {
 // ─── 设置接口 / Settings interface ────────────────────────────────────────
 
 export type AttachmentPathMode = 'obsidian' | 'custom' | 'samename';
-export type LinkFormat = 'wikilink' | 'markdown';
 export type Language = 'auto' | 'en' | 'zh';
 
 export interface AutoDownloadSettings {
@@ -173,7 +157,6 @@ export interface AutoDownloadSettings {
   language:               Language;
   attachmentPathMode:     AttachmentPathMode;
   customAttachmentFolder: string;
-  linkFormat:             LinkFormat;
 }
 
 export const DEFAULT_SETTINGS: AutoDownloadSettings = {
@@ -182,7 +165,6 @@ export const DEFAULT_SETTINGS: AutoDownloadSettings = {
   language:               'auto',
   attachmentPathMode:     'obsidian',
   customAttachmentFolder: 'attachments',
-  linkFormat:             'wikilink',
 };
 
 // ─── 设置页 / Settings tab ─────────────────────────────────────────────────
@@ -295,20 +277,5 @@ export class AutoDownloadSettingTab extends PluginSettingTab {
           text.inputEl.addClass('auto-dl-custom-folder-input');
         });
     }
-
-    // ── 图片引用格式 / Image link format ─────────────────────────────────
-    new Setting(containerEl)
-      .setName(t.linkFormatSettingName)
-      .setDesc(t.linkFormatSettingDesc)
-      .addDropdown(drop => {
-        drop
-          .addOption('wikilink', t.linkFormatWikilink)
-          .addOption('markdown', t.linkFormatMarkdown)
-          .setValue(this.plugin.settings.linkFormat)
-          .onChange(async (value) => {
-            this.plugin.settings.linkFormat = value as LinkFormat;
-            await this.plugin.saveSettings();
-          });
-      });
   }
 }
