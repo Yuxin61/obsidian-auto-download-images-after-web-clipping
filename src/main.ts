@@ -1,3 +1,5 @@
+/* global Buffer */
+
 import { Notice, Plugin, TFile, normalizePath } from 'obsidian';
 import {
   AutoDownloadSettings,
@@ -53,6 +55,33 @@ const MIME_EXT_MAP: Record<string, string> = {
 // Regex for inferring extension from URL, kept in sync with MIME_EXT_MAP values
 const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'avif', 'bmp'];
 const URL_EXT_REGEX = new RegExp(`\\.(${IMAGE_EXTS.join('|')})$`, 'i');
+
+// ─── Node.js https 模块的最小化类型定义 / Minimal type defs ────────────────
+
+interface HttpsResponse {
+  statusCode: number;
+  headers: Record<string, string | string[] | undefined>;
+  on(event: 'data', cb: (chunk: Uint8Array) => void): void;
+  on(event: 'end', cb: () => void): void;
+}
+
+interface HttpsRequest {
+  on(event: 'error', cb: (err: Error) => void): void;
+  on(event: 'timeout', cb: () => void): void;
+  destroy(): void;
+}
+
+interface HttpsOptions {
+  hostname: string;
+  path: string;
+  method: string;
+  headers: Record<string, string>;
+  timeout: number;
+}
+
+interface HttpsModule {
+  get(options: HttpsOptions, callback: (res: HttpsResponse) => void): HttpsRequest;
+}
 
 // ─── 工具函数 / Utility functions ──────────────────────────────────────────
 
@@ -154,7 +183,7 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
 
   // 缓存的 Node.js https 模块引用（仅桌面端可用）
   // Cached Node.js https module reference (desktop only)
-  private _httpsModule: any = null;
+  private _httpsModule: HttpsModule | null = null;
 
   get t(): TranslationMap {
     return TRANSLATIONS[this._resolvedLang] ?? TRANSLATIONS['en']!;
@@ -171,8 +200,7 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
     // 缓存 https 模块（仅 Electron 桌面端可用）
     // Cache https module (only available in Electron desktop)
     try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      this._httpsModule = (window as any).require('https');
+      this._httpsModule = (window as unknown as { require(id: 'https'): HttpsModule }).require('https');
     } catch {
       this._httpsModule = null;
     }
@@ -389,7 +417,7 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
   }
 
   private async _tryReferers(
-    https: any,
+    https: HttpsModule,
     url: string,
     referersToTry: string[],
     maxRetries: number,
@@ -429,7 +457,7 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
   }
 
   private _httpsGet(
-    https: any,
+    https: HttpsModule,
     url: string,
     referer: string,
   ): Promise<{ type: 'success'; buffer: ArrayBuffer; contentType: string } | { type: '403' | 'non-403-4xx'; status: number } | { type: 'network-error' | 'too-many-redirects'; error?: string }> {
@@ -451,14 +479,14 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
           timeout: HTTPS_TIMEOUT_MS,
         };
 
-        const req = https.get(options, (res: any) => {
+        const req = https.get(options, (res: HttpsResponse) => {
           if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
             if (hops >= MAX_REDIRECTS) {
               resolve({ type: 'too-many-redirects' });
               return;
             }
             hops++;
-            currentUrl = new URL(res.headers.location, currentUrl).toString();
+            currentUrl = new URL(res.headers.location as string, currentUrl).toString();
             makeRequest(currentUrl);
             return;
           }
@@ -473,14 +501,14 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
             return;
           }
 
-          const contentType = res.headers['content-type'] ?? '';
+          const contentType = (res.headers['content-type'] as string) ?? '';
           const chunks: Buffer[] = [];
 
           res.on('data', (chunk: Buffer) => { chunks.push(chunk); });
 
           res.on('end', () => {
             const buffer = Buffer.concat(chunks);
-            const arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength) as ArrayBuffer;
+            const arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
             resolve({ type: 'success', buffer: arrayBuffer, contentType });
           });
         });
@@ -580,6 +608,8 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
     this._resolvedLang   = this.settings.language === 'auto' ? detectObsidianLang() : this.settings.language;
     this._watchedFolders = parseFolders(this.settings.watchFolders);
     this._useMarkdownLinks = await this.resolveUseMarkdownLinks();
+    // navigator.userAgent is intentionally used here to get the real browser UA for HTTP headers
+    // eslint-disable-next-line obsidianmd/platform
     this._userAgent = navigator.userAgent;
   }
 
@@ -587,5 +617,6 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
     await this.saveData(this.settings);
     this._resolvedLang   = this.settings.language === 'auto' ? detectObsidianLang() : this.settings.language;
     this._watchedFolders = parseFolders(this.settings.watchFolders);
+    this._useMarkdownLinks = await this.resolveUseMarkdownLinks();
   }
 }
