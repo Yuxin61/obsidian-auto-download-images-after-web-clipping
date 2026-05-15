@@ -28,6 +28,16 @@ const RETRY_DELAY_MS = 1500;
 // 同时下载图片的最大并发数 | Maximum number of concurrent image downloads
 const DOWNLOAD_CONCURRENCY = 3;
 
+// HTTP 重定向最大跟随次数 | Maximum number of redirect hops to follow
+const MAX_REDIRECTS = 5;
+
+// https 请求超时毫秒数 | https request timeout in milliseconds
+const HTTPS_TIMEOUT_MS = 15000;
+
+// 默认扩展名和下载失败哨兵值 | Default extension and download failure sentinel value
+const DEFAULT_EXT = '.jpg';
+const FAILED_DOWNLOAD = { buffer: null as ArrayBuffer | null, ext: DEFAULT_EXT };
+
 // MIME 类型到文件扩展名的映射表 | Map from MIME type to file extension
 const MIME_EXT_MAP: Record<string, string> = {
   'image/jpeg':    '.jpg',
@@ -38,6 +48,11 @@ const MIME_EXT_MAP: Record<string, string> = {
   'image/avif':    '.avif',
   'image/bmp':     '.bmp',
 };
+
+// 从 URL 推断扩展名的正则，与 MIME_EXT_MAP 的值保持同步
+// Regex for inferring extension from URL, kept in sync with MIME_EXT_MAP values
+const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'avif', 'bmp'];
+const URL_EXT_REGEX = new RegExp(`\\.(${IMAGE_EXTS.join('|')})$`, 'i');
 
 // ─── 工具函数 / Utility functions ──────────────────────────────────────────
 
@@ -133,6 +148,14 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
   // 缓存的 Obsidian「使用 Wiki 链接」设置 | Cached Obsidian "Use Wiki Links" setting
   _useMarkdownLinks: boolean;
 
+  // 缓存的 User-Agent（复用 Obsidian 自带的 UA）
+  // Cached User-Agent (reuses Obsidian's own UA)
+  _userAgent: string = '';
+
+  // 缓存的 Node.js https 模块引用（仅桌面端可用）
+  // Cached Node.js https module reference (desktop only)
+  private _httpsModule: any = null;
+
   get t(): TranslationMap {
     return TRANSLATIONS[this._resolvedLang] ?? TRANSLATIONS['en']!;
   }
@@ -144,6 +167,15 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
     this.processingFiles = new Set();
     this.failedUrls = new Set();
     this.debounceTimers = new Map();
+
+    // 缓存 https 模块（仅 Electron 桌面端可用）
+    // Cache https module (only available in Electron desktop)
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      this._httpsModule = (window as any).require('https') as any;
+    } catch {
+      this._httpsModule = null;
+    }
 
     this.registerEvent(
       this.app.vault.on('modify', (file) => {
@@ -186,8 +218,6 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
 
     switch (attachmentPathMode) {
       case 'obsidian': {
-        // 通过扩展类型访问 Obsidian 内部 vault 配置，getConfig 是未公开但稳定的 API
-        // Access Obsidian's internal vault config via extended type; getConfig is an undocumented but stable API
         const vaultWithConfig = this.app.vault as typeof this.app.vault & { getConfig(key: string): unknown };
         const setting = (vaultWithConfig.getConfig('attachmentFolderPath') as string | undefined) ?? 'attachments';
         if (setting === '/') return normalizePath('/');
@@ -210,14 +240,12 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
   }
 
   async downloadImagesInFile(file: TFile): Promise<void> {
-    // 同一文件同时只允许一个任务运行 | Only one task per file at a time
     if (this.processingFiles.has(file.path)) return;
     this.processingFiles.add(file.path);
 
     const t = this.t;
 
     try {
-      // ── 1. 读取文件 / Read file ───────────────────────────────────────
       let content: string;
       try {
         content = await this.app.vault.read(file);
@@ -226,14 +254,10 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
         return;
       }
 
-      // ── 2. 无状态检测：同时扫描 Markdown 图片和 HTML img 标签
-      //       Stateless detection: scan for Markdown images and HTML img tags simultaneously
       const mdMatches   = [...content.matchAll(MD_IMAGE_REGEX)];
       const htmlMatches = [...content.matchAll(HTML_IMG_REGEX)];
       if (mdMatches.length === 0 && htmlMatches.length === 0) return;
 
-      // 从 frontmatter 提取页面来源 URL 作为下载 Referer
-      // Extract source page URL from frontmatter to use as download Referer
       const cachedMetadata = this.app.metadataCache.getFileCache(file);
       const pageReferer = extractRefererFromFrontmatter(cachedMetadata?.frontmatter);
 
@@ -243,8 +267,6 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
         console.debug(t.consoleRefererFallback);
       }
 
-      // 收集所有唯一 URL，排除已知失败项
-      // Collect all unique URLs, excluding known failures
       const allUrls = [
         ...mdMatches.map(m => m[2]),
         ...htmlMatches.map(m => m[1] ?? m[2]),
@@ -252,7 +274,6 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
       const uniqueUrls = [...new Set(allUrls)].filter(u => !this.failedUrls.has(u));
       if (uniqueUrls.length === 0) return;
 
-      // ── 3. 确保附件目录存在 / Ensure attachment folder exists ──────────
       const attachmentFolder = this.resolveAttachmentFolder(file);
       await this.ensureFolder(attachmentFolder);
 
@@ -260,22 +281,18 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
         .replace(/\s+/g, '-')
         .replace(/[\\/:*?"<>|]/g, '_');
 
-      // ── 4. 并行下载所有唯一 URL（最多 DOWNLOAD_CONCURRENCY 个同时进行）
-      //       Download all unique URLs in parallel (up to DOWNLOAD_CONCURRENCY at a time)
-      const urlToLocal = new Map<string, string>(); // url → destPath
+      const urlToLocal = new Map<string, string>();
       const failedUrls: string[]  = [];
       let savedCount = 1;
 
-      // 并行获取所有图片内容 | Fetch all images in parallel with concurrency limit
       const downloadResults = await runWithConcurrency(
         uniqueUrls.map(url => async () => {
-          const result = await this.fetchWithRetry(url, 3, pageReferer);
+          const result = await this.downloadImage(url, pageReferer);
           return { url, ...result };
         }),
         DOWNLOAD_CONCURRENCY
       );
 
-      // 顺序保存到磁盘，避免命名冲突 | Save to disk sequentially to avoid naming conflicts
       for (const { url, buffer, ext } of downloadResults) {
         if (!buffer) {
           this.failedUrls.add(url);
@@ -300,8 +317,6 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
         }
       }
 
-      // ── 5. 原子写回：用 vault.process 替换所有成功下载的链接
-      //       Atomic write-back: replace all successfully downloaded links via vault.process
       if (urlToLocal.size > 0) {
         const useMarkdownLinks = this._useMarkdownLinks;
         try {
@@ -310,10 +325,6 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
             for (const [url, destPath] of urlToLocal) {
               const urlEscaped = url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-              // 先替换带链接的 Markdown 图片：[![alt](url)](link-url)
-              // 如果没有匹配到（独立图片），再由下面的正则处理
-              // First replace linked Markdown images: [![alt](url)](link-url)
-              // If no match (standalone image), the regex below handles it
               const linkedMdRe = new RegExp(
                 `\\[!\\[([^\\]]*)\\]\\(${urlEscaped}(?:\\s+(?:"[^"]*"|'[^']*'))?\\)\\]\\(([^)]+)\\)`,
                 'g'
@@ -322,8 +333,6 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
                 formatLinkedImageLink(destPath, alt, linkUrl, useMarkdownLinks)
               );
 
-              // 替换 Markdown 格式图片链接（含可选 title）
-              // Replace Markdown image links (with optional title)
               const mdRe = new RegExp(
                 `!\\[([^\\]]*)\\]\\(${urlEscaped}(?:\\s+(?:"[^"]*"|'[^']*'))?\\)`,
                 'g'
@@ -332,8 +341,6 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
                 formatImageLink(destPath, alt, useMarkdownLinks)
               );
 
-              // 替换 HTML <img> 标签，从标签属性中提取 alt
-              // Replace HTML <img> tags, extracting alt from tag attributes
               const htmlRe = new RegExp(
                 `<img\\s[^>]*\\bsrc=(?:"${urlEscaped}"|'${urlEscaped}')[^>]*>`,
                 'gi'
@@ -353,7 +360,6 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
         }
       }
 
-      // ── 6. 通知用户 / Notify user ─────────────────────────────────────
       const successCount = urlToLocal.size;
       if (failedUrls.length === 0 && successCount > 0) {
         new Notice(t.noticeSuccess(successCount, file.basename));
@@ -363,78 +369,184 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
       }
 
     } finally {
-      // 无论成功还是失败都释放锁 | Release the lock regardless of success or failure
       this.processingFiles.delete(file.path);
     }
   }
 
-  async fetchWithRetry(url: string, maxRetries = 3, pageReferer?: string): Promise<{ buffer: ArrayBuffer | null; ext: string }> {
+  // ── 下载方法 / Download methods ──────────────────────────────────────────
+
+  async downloadImage(url: string, pageReferer?: string): Promise<{ buffer: ArrayBuffer | null; ext: string }> {
+    const result = await this.downloadWithRequestUrl(url);
+    if (result.buffer) return result;
+
+    if (pageReferer && this._httpsModule) {
+      return this.downloadWithNodeHttps(url, pageReferer, 3);
+    }
+
+    return FAILED_DOWNLOAD;
+  }
+
+  private async downloadWithRequestUrl(url: string): Promise<{ buffer: ArrayBuffer | null; ext: string }> {
+    try {
+      const resp = await requestUrl({ url, throw: false });
+
+      if (resp.status >= 400) return FAILED_DOWNLOAD;
+
+      const contentType = resp.headers['content-type'] ?? '';
+      return this.validateResponse(resp.arrayBuffer, contentType, url);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[AutoDL] requestUrl 请求失败 / request failed: ${url} — ${msg}`);
+      return FAILED_DOWNLOAD;
+    }
+  }
+
+  private downloadWithNodeHttps(url: string, pageReferer: string, maxRetries = 3): Promise<{ buffer: ArrayBuffer | null; ext: string }> {
     const t = this.t;
+    const https = this._httpsModule!;
     const imageOrigin = new URL(url).origin;
 
-    // 不同源时双 Referer 策略：先页面 Referer（应对防盗链），失败回退图片 origin
-    // Dual-Referer strategy for cross-origin: try page Referer first (bypass hotlink protection), then image origin
-    const referersToTry: string[] = pageReferer && pageReferer !== imageOrigin
+    const referersToTry: string[] = pageReferer !== imageOrigin
       ? [pageReferer, imageOrigin]
-      : [pageReferer ?? imageOrigin];
+      : [pageReferer];
 
+    return this._tryReferers(https, url, referersToTry, maxRetries, t);
+  }
+
+  private async _tryReferers(
+    https: any,
+    url: string,
+    referersToTry: string[],
+    maxRetries: number,
+    t: TranslationMap,
+  ): Promise<{ buffer: ArrayBuffer | null; ext: string }> {
     for (const referer of referersToTry) {
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-          const resp = await requestUrl({
-            url,
-            headers: {
-              'Referer':    referer,
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            },
-            throw: false,
-          });
+        const result = await this._httpsGet(https, url, referer);
 
-          if (resp.status >= 400 && resp.status < 500) {
-            console.warn(t.console4xx(resp.status, url));
-            // 仅 403 可能与 Referer 相关，切换 referer 重试；其余 4xx 换 referer 无意义
-            // Only 403 may be Referer-related; other 4xx won't change with a different Referer
-            if (resp.status !== 403) return { buffer: null, ext: '.jpg' };
-            break;
-          }
+        switch (result.type) {
+          case 'success':
+            return this.validateResponse(result.buffer, result.contentType, url);
 
-          if (resp.status >= 300) {
-            throw new Error(`HTTP ${resp.status}`);
-          }
+          case 'non-403-4xx':
+            console.warn(t.console4xx(result.status, url));
+            return FAILED_DOWNLOAD;
 
-          const contentType = resp.headers['content-type'] ?? '';
-          const isImage  = contentType.startsWith('image/');
-          const isBinary = contentType.includes('application/octet-stream') || contentType === '';
-          if (!isImage && !isBinary) {
-            console.warn(t.consoleSkipNonImage(contentType, url));
-            break;
-          }
+          case '403':
+            console.warn(t.console4xx(403, url));
+            break; // 换下一个 Referer | switch to next referer
 
-          if (resp.arrayBuffer.byteLength < MIN_IMAGE_BYTES) {
-            console.warn(t.consoleSkipTooSmall(resp.arrayBuffer.byteLength, url));
-            return { buffer: null, ext: '.jpg' };
-          }
-
-          const ext = this.extFromContentType(contentType) ?? this.extractExt(url);
-          return { buffer: resp.arrayBuffer, ext };
-
-        } catch (err) {
-          const isLastAttempt = attempt === maxRetries;
-          const msg = err instanceof Error ? err.message : String(err);
-          if (isLastAttempt) {
-            console.warn(t.consoleGiveUp(attempt, url, msg));
-            break;
-          }
-          console.warn(t.consoleRetry(attempt, RETRY_DELAY_MS, url, msg));
-          await sleep(RETRY_DELAY_MS);
+          case 'network-error':
+          case 'too-many-redirects':
+            if (attempt === maxRetries) {
+              console.warn(t.consoleGiveUp(attempt, url, result.error!));
+              break; // 跳出重试循环，换下一个 Referer | break retry loop, try next referer
+            }
+            console.warn(t.consoleRetry(attempt, RETRY_DELAY_MS, url, result.error!));
+            await sleep(RETRY_DELAY_MS);
+            continue; // 继续当前 Referer 的下一次重试 | continue with next retry for same referer
         }
+        // 403 break 或 network-error(最后一次) break 到这里 → 跳出内层重试循环
+        // 403 break or network-error(last attempt) break → exit inner retry loop
+        break;
       }
     }
 
-    return { buffer: null, ext: '.jpg' };
+    return FAILED_DOWNLOAD;
   }
 
-  // 根据 Content-Type 响应头推断扩展名 | Infer file extension from Content-Type header
+  private _httpsGet(
+    https: any,
+    url: string,
+    referer: string,
+  ): Promise<{ type: 'success'; buffer: ArrayBuffer; contentType: string } | { type: '403' | 'non-403-4xx'; status: number } | { type: 'network-error' | 'too-many-redirects'; error?: string }> {
+    return new Promise((resolve) => {
+      let currentUrl = url;
+      let hops = 0;
+
+      const makeRequest = (requestUrl: string): void => {
+        const parsedUrl = new URL(requestUrl);
+        const options = {
+          hostname: parsedUrl.hostname,
+          path: parsedUrl.pathname + parsedUrl.search,
+          method: 'GET' as const,
+          headers: {
+            'Referer':    referer,
+            'User-Agent': this._userAgent,
+            'Accept':     'image/avif,image/webp,image/png,image/svg+xml,image/*,*/*;q=0.8',
+          },
+          timeout: HTTPS_TIMEOUT_MS,
+        };
+
+        const req = https.get(options, (res: any) => {
+          if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+            if (hops >= MAX_REDIRECTS) {
+              resolve({ type: 'too-many-redirects' });
+              return;
+            }
+            hops++;
+            currentUrl = new URL(res.headers.location, currentUrl).toString();
+            makeRequest(currentUrl);
+            return;
+          }
+
+          if (res.statusCode && res.statusCode >= 400 && res.statusCode < 500) {
+            resolve({ type: res.statusCode === 403 ? '403' : 'non-403-4xx', status: res.statusCode });
+            return;
+          }
+
+          if (!res.statusCode || res.statusCode >= 300) {
+            resolve({ type: 'network-error', error: `HTTP ${res.statusCode}` });
+            return;
+          }
+
+          const contentType = res.headers['content-type'] ?? '';
+          const chunks: Buffer[] = [];
+
+          res.on('data', (chunk: Buffer) => { chunks.push(chunk); });
+
+          res.on('end', () => {
+            const buffer = Buffer.concat(chunks);
+            // Node.js Buffer → ArrayBuffer，与 requestUrl 返回类型统一
+            // Node.js Buffer → ArrayBuffer, aligned with requestUrl return type
+            const arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength) as ArrayBuffer;
+            resolve({ type: 'success', buffer: arrayBuffer, contentType });
+          });
+        });
+
+        req.on('error', (err: Error) => {
+          resolve({ type: 'network-error', error: err.message });
+        });
+
+        req.on('timeout', () => {
+          req.destroy();
+          resolve({ type: 'network-error', error: 'Request timeout' });
+        });
+      };
+
+      makeRequest(url);
+    });
+  }
+
+  private validateResponse(rawBuffer: ArrayBuffer, contentType: string, url: string): { buffer: ArrayBuffer | null; ext: string } {
+    const t = this.t;
+
+    const isImage  = contentType.startsWith('image/');
+    const isBinary = contentType.includes('application/octet-stream') || contentType === '';
+    if (!isImage && !isBinary) {
+      console.warn(t.consoleSkipNonImage(contentType, url));
+      return FAILED_DOWNLOAD;
+    }
+
+    if (rawBuffer.byteLength < MIN_IMAGE_BYTES) {
+      console.warn(t.consoleSkipTooSmall(rawBuffer.byteLength, url));
+      return FAILED_DOWNLOAD;
+    }
+
+    const ext = this.extFromContentType(contentType) ?? this.extractExt(url);
+    return { buffer: rawBuffer, ext };
+  }
+
   extFromContentType(contentType: string): string | null {
     const mimeKey = contentType.split(';')[0]?.trim() ?? '';
     return MIME_EXT_MAP[mimeKey] ?? null;
@@ -452,15 +564,11 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
       candidate = normalizePath(`${folder}/${stem}(${counter})${ext}`);
       if (!await this.app.vault.adapter.exists(candidate)) return candidate;
     }
-    // 超出上限时用时间戳兜底 | Fall back to timestamp suffix when counter exceeds limit
     return normalizePath(`${folder}/${stem}(${Date.now()})${ext}`);
   }
 
-  // 确保目录存在：先整体检查，再逐级创建，容忍并发竞态
-  // Ensure folder exists: quick full-path check first, then create segment by segment, tolerating race conditions
   async ensureFolder(folderPath: string): Promise<void> {
     if (!folderPath || folderPath === '/') return;
-    // 绝大多数情况下文件夹已存在，一次检查即可返回 | Fast path: folder already exists in the common case
     if (await this.app.vault.adapter.exists(folderPath)) return;
 
     const parts = folderPath.split('/').filter(p => p);
@@ -471,28 +579,20 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
         try {
           await this.app.vault.createFolder(current);
         } catch (err) {
-          // 若并发任务已先创建，exists 此时应为 true，否则真正报错
-          // If a concurrent task already created it, exists should now be true; otherwise re-throw
           if (!await this.app.vault.adapter.exists(current)) throw err;
         }
       }
     }
   }
 
-  // 从 URL 推断扩展名（作为 Content-Type 的回退）
-  // Infer extension from URL (fallback when Content-Type is unavailable)
   extractExt(url: string): string {
     const parts = url.split('?');
     const noQuery = parts[0] ?? url;
     const clean = noQuery.split('#')[0] ?? noQuery;
-    const m = clean.match(/\.(jpg|jpeg|png|gif|webp|svg|avif|bmp)$/i);
-    return m ? `.${(m[1] ?? 'jpg').toLowerCase()}` : '.jpg';
+    const m = clean.match(URL_EXT_REGEX);
+    return m ? `.${(m[1] ?? 'jpg').toLowerCase()}` : DEFAULT_EXT;
   }
 
-  // 读取 Obsidian「使用 Wiki 链接」设置来决定图片引用格式
-  // 该设置不在公开 API 中，通过读取 .obsidian/app.json 获取
-  // Read Obsidian "Use Wiki Links" setting to determine image link format
-  // This setting is not in the public API, read from .obsidian/app.json
   private async resolveUseMarkdownLinks(): Promise<boolean> {
     try {
       const configPath = `${this.app.vault.configDir}/app.json`;
@@ -500,22 +600,20 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
       const config = JSON.parse(raw) as Record<string, unknown>;
       return config.useMarkdownLinks === true;
     } catch {
-      // 读取失败时默认使用 wikilink | Default to wikilink on read failure
       return false;
     }
   }
 
   async loadSettings(): Promise<void> {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<AutoDownloadSettings>);
-    // 缓存解析结果，避免每次事件都重新计算 | Cache derived values to avoid recomputation on every event
     this._resolvedLang   = this.settings.language === 'auto' ? detectObsidianLang() : this.settings.language;
     this._watchedFolders = parseFolders(this.settings.watchFolders);
     this._useMarkdownLinks = await this.resolveUseMarkdownLinks();
+    this._userAgent = navigator.userAgent;
   }
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
-    // 设置变更后同步刷新缓存 | Refresh caches after settings change
     this._resolvedLang   = this.settings.language === 'auto' ? detectObsidianLang() : this.settings.language;
     this._watchedFolders = parseFolders(this.settings.watchFolders);
   }

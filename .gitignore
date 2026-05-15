@@ -30,3 +30,6 @@ CLAUDE.md
 
 # eslint
 .eslintcache
+
+# test scripts
+test-referer.mjs
