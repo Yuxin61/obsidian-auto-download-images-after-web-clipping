@@ -31,7 +31,7 @@ jobs:
 
       # 安装依赖并编译 TypeScript | Install dependencies and compile TypeScript
       - name: Install dependencies and build
-        run: npm ci && npm run build
+        run: npm install --legacy-peer-deps && npm run build
 
       # 从 manifest.json 读取版本号 | Read version from manifest.json
       - name: Read manifest metadata
