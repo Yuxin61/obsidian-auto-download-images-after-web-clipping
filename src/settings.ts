@@ -43,6 +43,10 @@ export interface TranslationMap {
   consoleRefererResolved:  (referer: string) => string;
   consoleRefererFallback:   string;
   consoleLoaded:            (folders: string) => string;
+
+  consoleBase64Saved:      (n: number, name: string) => string;
+  consoleBase64TooLarge:   (bytes: number, n: number) => string;
+  consoleBase64TooSmall:   (bytes: number, n: number) => string;
 }
 
 export const TRANSLATIONS: Record<string, TranslationMap> = {
@@ -91,6 +95,10 @@ export const TRANSLATIONS: Record<string, TranslationMap> = {
     consoleRefererResolved:       (referer) => `[AutoDL] Referer resolved from page source: ${referer}`,
     consoleRefererFallback:       '[AutoDL] No page referer found, falling back to image origin',
     consoleLoaded:              (folders) => `Auto Download Images After Clipping: started, watching → ${folders}`,
+
+    consoleBase64Saved:         (n, name) => `[AutoDL] Extracted ${n} base64 image(s) from ${name}`,
+    consoleBase64TooLarge:      (bytes, n) => `[AutoDL] Base64 image #${n} too large (${bytes}B > 5MB), skipping`,
+    consoleBase64TooSmall:      (bytes, n) => `[AutoDL] Base64 image #${n} too small (${bytes}B), likely a tracking pixel, skipping`,
   },
 
   zh: {
@@ -138,6 +146,10 @@ export const TRANSLATIONS: Record<string, TranslationMap> = {
     consoleRefererResolved:       (referer) => `[AutoDL] 已从页面来源提取 Referer: ${referer}`,
     consoleRefererFallback:       '[AutoDL] 未找到页面 Referer，回退使用图片自身 origin',
     consoleLoaded:              (folders) => `剪藏后自动下载图片：已启动，监听文件夹 → ${folders}`,
+
+    consoleBase64Saved:         (n, name) => `[AutoDL] 已从 ${name} 提取 ${n} 张 base64 图片`,
+    consoleBase64TooLarge:      (bytes, n) => `[AutoDL] Base64 图片 #${n} 过大（${bytes}B > 5MB），跳过`,
+    consoleBase64TooSmall:      (bytes, n) => `[AutoDL] Base64 图片 #${n} 过小（${bytes}B），疑似追踪像素，跳过`,
   },
 };
 

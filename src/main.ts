@@ -9,6 +9,7 @@ import {
   TRANSLATIONS,
   detectObsidianLang,
 } from './settings';
+import { extractBase64Images, replaceBase64Uris } from './base64';
 
 // ─── 正则 / Regexes ────────────────────────────────────────────────────────
 
@@ -284,7 +285,30 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
 
       const mdMatches   = [...content.matchAll(MD_IMAGE_REGEX)];
       const htmlMatches = [...content.matchAll(HTML_IMG_REGEX)];
-      if (mdMatches.length === 0 && htmlMatches.length === 0) return;
+
+      const titleBase = file.basename
+        .replace(/\s+/g, '-')
+        .replace(/[\\/:*?"<>|]/g, '_');
+
+      // ── Base64 extraction ─────────────────────────────────────────────
+      const base64UriToLocal = await extractBase64Images(
+        content,
+        this.resolveAttachmentFolder(file),
+        titleBase,
+        {
+          resolveDestPath: (folder, name) => this.resolveDestPath(folder, name),
+          ensureFolder: (folder) => this.ensureFolder(folder),
+          writeBinary: (path, data) => this.app.vault.adapter.writeBinary(path, data),
+        },
+        (bytes, n) => console.warn(t.consoleBase64TooLarge(bytes, n)),
+        (bytes, n) => console.warn(t.consoleBase64TooSmall(bytes, n)),
+        (path, err) => console.error(t.consoleWriteFailed(path, err)),
+      );
+      if (base64UriToLocal.size > 0) {
+        console.debug(t.consoleBase64Saved(base64UriToLocal.size, file.basename));
+      }
+
+      if (mdMatches.length === 0 && htmlMatches.length === 0 && base64UriToLocal.size === 0) return;
 
       const cachedMetadata = this.app.metadataCache.getFileCache(file);
       const pageReferer = extractRefererFromFrontmatter(cachedMetadata?.frontmatter);
@@ -300,26 +324,22 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
         ...htmlMatches.map(m => m[1] ?? m[2]),
       ].filter((u): u is string => Boolean(u));
       const uniqueUrls = [...new Set(allUrls)].filter(u => !this.failedUrls.has(u));
-      if (uniqueUrls.length === 0) return;
 
       const attachmentFolder = this.resolveAttachmentFolder(file);
-      await this.ensureFolder(attachmentFolder);
-
-      const titleBase = file.basename
-        .replace(/\s+/g, '-')
-        .replace(/[\\/:*?"<>|]/g, '_');
-
       const urlToLocal = new Map<string, string>();
       const failedUrls: string[]  = [];
-      let savedCount = 1;
 
-      const downloadResults = await runWithConcurrency(
-        uniqueUrls.map(url => async () => {
-          const result = await this.downloadImage(url, pageReferer);
-          return { url, ...result };
-        }),
-        DOWNLOAD_CONCURRENCY
-      );
+      if (uniqueUrls.length > 0) {
+        await this.ensureFolder(attachmentFolder);
+        let savedCount = 1;
+
+        const downloadResults = await runWithConcurrency(
+          uniqueUrls.map(url => async () => {
+            const result = await this.downloadImage(url, pageReferer);
+            return { url, ...result };
+          }),
+          DOWNLOAD_CONCURRENCY
+        );
 
       for (const { url, buffer, ext } of downloadResults) {
         if (!buffer) {
@@ -344,12 +364,17 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
           console.error(t.consoleWriteFailed(destPath, err));
         }
       }
+      } // end if (uniqueUrls.length > 0)
 
-      if (urlToLocal.size > 0) {
+      if (urlToLocal.size > 0 || base64UriToLocal.size > 0) {
         const useMarkdownLinks = this._useMarkdownLinks;
         try {
           await this.app.vault.process(file, (currentContent) => {
-            let updated = currentContent;
+            let updated = replaceBase64Uris(
+              currentContent,
+              base64UriToLocal,
+              (destPath, alt) => formatImageLink(destPath, alt, useMarkdownLinks),
+            );
             for (const [url, destPath] of urlToLocal) {
               const urlEscaped = url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -388,7 +413,7 @@ export default class AutoDownloadAttachmentsPlugin extends Plugin {
         }
       }
 
-      const successCount = urlToLocal.size;
+      const successCount = urlToLocal.size + base64UriToLocal.size;
       if (failedUrls.length === 0 && successCount > 0) {
         new Notice(t.noticeSuccess(successCount, file.basename));
       } else if (failedUrls.length > 0) {
